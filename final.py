@@ -352,7 +352,7 @@ class OverlayNetwork:
                         merged_cluster = current.merge(target_cluster)
                         new_clusters.append(merged_cluster)
                         merged.update([current.min_id, target_cluster.min_id])
-                        i += 2
+                        i += 1
                     else:
                         new_clusters.append(current)
                         merged.add(current.min_id)
@@ -493,4 +493,5 @@ if __name__ == "__main__":
     stats = OverlayNetwork.test_algorithm(G, sketch_size=512, stages=20, runs=2)
     print("Risultati medi su 10 run:")
     for metric, vals in stats.items():
+
         print(f"{metric}: media={vals['mean']:.4f}, std={vals['std']:.4f}")
