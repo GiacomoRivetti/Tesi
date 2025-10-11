@@ -8,60 +8,23 @@ import time
 import math
 
 class Node:
-    def __init__(self, node_id, sketch_size):
+    def __init__(self, node_id):
         self.id = node_id
         self.neighbors = set()
-        self.sketch_vector = np.zeros(sketch_size)
-        self.local_sketch = None
-        self.random_bits = None
         self.cluster_id = node_id
 
     def add_neighbor(self, neighbor_id):
         self.neighbors.add(neighbor_id)
 
-    def compute_edge_id(self, neighbor_id):
-        u, v = sorted((self.id, neighbor_id))
-        return hash((u, v)) % 10000
-
-    def compute_sketch(self, MG):
-        self.sketch_vector = np.zeros(MG.shape[0])
-        for neighbor in self.neighbors:
-            edge_id = self.compute_edge_id(neighbor)
-            self.sketch_vector += MG[:, edge_id]
-
 class Cluster:
-    def __init__(self, nodes, sketch_size):
+    def __init__(self, nodes):
         self.nodes = nodes
         self.ids = {n.id for n in nodes}
         self.min_id = min(self.ids)
-        self.sketch_size = sketch_size
-        self.random_bits = self.generate_random_bits()
         
         for node in nodes:
             node.cluster_id = self.min_id
-            node.random_bits = self.random_bits
 
-    def generate_random_bits(self, length=16):
-        return ''.join(random.choice(['0', '1']) for _ in range(length))
-
-    def aggregate_sketch(self, MG, gossip_rounds=20):
-        for node in self.nodes:
-            node.compute_sketch(MG)
-
-        states = {node.id: (node.sketch_vector.copy(), 1.0 if node.id == self.min_id else 0.0)
-                  for node in self.nodes}
-
-        for _ in range(gossip_rounds):
-            new_states = {nid: (np.zeros(self.sketch_size), 0.0) for nid in states}
-            for nid, (sketch, weight) in states.items():
-                targets = [nid, random.choice(list(self.ids))]
-                for t in targets:
-                    new_states[t] = (new_states[t][0] + sketch / 2,
-                                     new_states[t][1] + weight / 2)
-            states = new_states
-
-        total_sketch = sum(s for (s, w) in states.values())
-        return total_sketch
 
     def sample_outgoing_edge(self, base_graph, cluster_map, max_attempts=10):
         outgoing_edges = []
@@ -81,19 +44,10 @@ class Cluster:
 
         return random.choice(outgoing_edges)
 
-
-
-    def find_outgoing_edges(self, all_cluster_ids):
-        outgoing = []
-        for node in self.nodes:
-            for neighbor in node.neighbors:
-                if neighbor not in self.ids:
-                    outgoing.append((node.id, neighbor))
-        return outgoing
     
     def merge(self, other):
         merged_nodes = list(set(self.nodes + other.nodes))
-        return Cluster(merged_nodes, self.sketch_size)
+        return Cluster(merged_nodes)
     
     
     def create_expander(self, log_degree=8, walk_length=5):
@@ -197,29 +151,28 @@ class Cluster:
             del node.new_neighbors
 
 class OverlayNetwork:
-    def __init__(self, graph=None, num_nodes=None, sketch_size=128):
-        self.sketch_size = sketch_size
+    def __init__(self, graph=None, num_nodes=None):
         self.results = []
 
         if graph is not None:
             self.base_graph = {u: list(graph.neighbors(u)) for u in graph.nodes()}
 
-            self.nodes = [Node(i, sketch_size) for i in range(graph.number_of_nodes())]
+            self.nodes = [Node(i) for i in range(graph.number_of_nodes())]
             for u, v in graph.edges():
                 self.nodes[u].add_neighbor(v)
                 self.nodes[v].add_neighbor(u)
         else:
-            self.nodes = [Node(i, sketch_size) for i in range(num_nodes)]
+            self.nodes = [Node(i) for i in range(num_nodes)]
             self.initialize_network()
             self.base_graph = {node.id: list(node.neighbors) for node in self.nodes}
 
-        self.clusters = [Cluster([n], sketch_size) for n in self.nodes]
+        self.clusters = [Cluster([n]) for n in self.nodes]
 
     def generate_sketch_matrix(self):
         np.random.seed(42)
         return np.random.choice([-1, 1], size=(self.sketch_size, 10000))
     
-    def test_algorithm(graph, sketch_size=1024, stages=20, runs=10):
+    def test_algorithm(graph, stages=20, runs=10):
         clusters_list = []
         internal_list = []
         time_list = []
@@ -230,13 +183,13 @@ class OverlayNetwork:
         final_diam_list = []
 
         for r in range(runs):
-            init_cond = OverlayNetwork.graph_internal_conductance(graph, samples=50)
+            init_cond = OverlayNetwork.min_conductance_pathlike(graph)
             init_diam = OverlayNetwork.diameter_or_lcc(graph)
 
             init_cond_list.append(init_cond)
             init_diam_list.append(init_diam)
 
-            net = OverlayNetwork(graph=graph, sketch_size=sketch_size)
+            net = OverlayNetwork(graph=graph)
             net.run(stages=stages)
 
             if net.results:
@@ -251,7 +204,7 @@ class OverlayNetwork:
                     for neigh in node.neighbors:
                         G_final.add_edge(node.id, neigh)
 
-                final_cond = OverlayNetwork.graph_internal_conductance(G_final, samples=50)
+                final_cond = OverlayNetwork.min_conductance_pathlike(G_final)
                 final_diam = OverlayNetwork.diameter_or_lcc(G_final)
 
                 final_cond_list.append(final_cond)
@@ -305,7 +258,6 @@ class OverlayNetwork:
                 if len(self.clusters) <= 1:
                     break
 
-                MG = self.generate_sketch_matrix()
                 new_clusters = []
                 merged = set()
                 all_cluster_ids = {c.min_id for c in self.clusters}
@@ -322,7 +274,6 @@ class OverlayNetwork:
                         continue
 
                     current = self.clusters[i]
-                    sketch_agg = current.aggregate_sketch(MG)
 
                     chosen_edge = None
                     for _ in range(attempts_per_cluster):
@@ -434,24 +385,21 @@ class OverlayNetwork:
 
         return min(phi_values) if phi_values else 0.0
     
-    def graph_internal_conductance(G, samples=50):
-        if G.number_of_nodes() <= 1 or G.number_of_edges() == 0:
-            return 0.0
-        vals = []
-        nodes = list(G.nodes)
+    def min_conductance_pathlike(G):
+        if not nx.is_connected(G):
+            G = G.subgraph(max(nx.connected_components(G), key=len)).copy()
+
+        nodes = list(G.nodes())
         n = len(nodes)
-        for _ in range(samples):
-            k = random.randint(1, n-1)
-            S = set(random.sample(nodes, k))
-            try:
-                phi = nx.algorithms.cuts.conductance(G, S)
-                vals.append(phi)
-            except Exception:
-                pass
-        if not vals:
-            return 0.0
-        vals.sort()
-        return vals[len(vals)//2]
+        min_phi = float("inf")
+
+        for k in range(1, n):
+            S = set(nodes[:k])
+            phi = nx.algorithms.cuts.conductance(G, S)
+            if phi < min_phi:
+                min_phi = phi
+
+        return min_phi
     
     def diameter_or_lcc(G):
         if G.number_of_nodes() == 0:
@@ -464,7 +412,7 @@ class OverlayNetwork:
 
     
 if __name__ == "__main__":
-    graph_type = "ER"  # ER, BA, WS, SBM, REGULAR
+    graph_type = "BA"  # ER, BA, WS, SBM, REGULAR
 
     if graph_type == "ER":
         G = nx.erdos_renyi_graph(n=1024, p=0.009)
@@ -490,7 +438,7 @@ if __name__ == "__main__":
     else:
         raise ValueError("Tipo di grafo non supportato")
 
-    stats = OverlayNetwork.test_algorithm(G, sketch_size=512, stages=20, runs=2)
+    stats = OverlayNetwork.test_algorithm(G, stages=20, runs=2)
     print("Risultati medi su 10 run:")
     for metric, vals in stats.items():
 
